@@ -10,13 +10,100 @@ import { esc, euro, plain, uid, toEUR, $ } from './utils.js';
 import { state, saveToStorage, loadFromStorage, clearStorage } from './state.js';
 
 /* ── Static data ────────────────────────────────────────────── */
-export const TAX_MODELS = [
-  { country: 'Italy',       rate: 0.26 },
-  { country: 'Switzerland', rate: 0.12 },
-  { country: 'Germany',     rate: 0.25 },
-  { country: 'France',      rate: 0.30 },
-  { country: 'UAE',         rate: 0.09 },
-];
+
+/**
+ * TAX_RATES_BY_CATEGORY
+ * Capital-gains / disposal tax rates for private individuals at the point of sale.
+ * Sources (2024-2025):
+ *   Italy   — TUIR art.67-68; L.197/2022 (crypto 26% → 33% from 2026); DPR 917/1986
+ *   Switzerland — Federal Tax Administration; cantonal real-estate CGT (avg ~20%)
+ *   Germany — EStG §20 Abgeltungsteuer 25%+Soli=26.375%; §23 Spekulationssteuer
+ *   France  — CGI art.150 UA/VI; PFU 30%; TFOP 6%+0.5% CRDS on precious objects
+ *   UAE     — No personal income or capital-gains tax (Federal Decree-Law 47/2022)
+ *
+ * Rates are the most commonly applicable rate for a private individual.
+ * 0 = no tax / exempt for private individuals in normal conditions.
+ */
+export const TAX_RATES_BY_CATEGORY = {
+  //           Italy   Switzerland  Germany  France   UAE
+  Car:       { Italy: 0,      Switzerland: 0,    Germany: 0,       France: 0,     UAE: 0 },
+  // Cars sold by private individuals are generally not subject to capital-gains tax
+  // (Italy: no CGT on personal-use vehicles; DE: exempt if held >1yr or personal use;
+  //  FR: movable property CGT only on collector/classic cars >€5k; CH/UAE: 0)
+
+  Motorbike: { Italy: 0,      Switzerland: 0,    Germany: 0,       France: 0,     UAE: 0 },
+  // Same treatment as cars — personal-use vehicles are CGT-exempt in all 5 countries
+
+  Home:      { Italy: 0.26,   Switzerland: 0.20, Germany: 0.25,    France: 0.362, UAE: 0 },
+  // Italy: 26% substitute tax on gain if sold within 5 yrs (primary residence exempt)
+  // Switzerland: avg cantonal real-estate CGT ~20% (range 10-60% depending on canton/holding)
+  // Germany: personal income tax rate on gain if sold within 10 yrs (avg ~25%); exempt after 10 yrs
+  // France: 19% IR + 17.2% social contributions = 36.2% (primary residence exempt)
+  // UAE: 0%
+
+  Cash:      { Italy: 0.26,   Switzerland: 0,    Germany: 0.26375, France: 0.30,  UAE: 0 },
+  // Interest/savings gains: Italy 26% substitute tax; CH: income tax on interest (no CGT);
+  // DE: 26.375% Abgeltungsteuer; FR: 30% PFU; UAE: 0%
+
+  Stocks:    { Italy: 0.26,   Switzerland: 0,    Germany: 0.26375, France: 0.30,  UAE: 0 },
+  // Italy: 26% imposta sostitutiva (art.67 TUIR); CH: 0% for private investors;
+  // DE: 26.375% Abgeltungsteuer; FR: 30% PFU; UAE: 0%
+
+  Crypto:    { Italy: 0.33,   Switzerland: 0,    Germany: 0,       France: 0.30,  UAE: 0 },
+  // Italy: 33% from 01/01/2026 (was 26%); CH: 0% private investor;
+  // DE: 0% if held >1 year (personal income rate if <1yr); FR: 30% PFU; UAE: 0%
+
+  Gold:      { Italy: 0.26,   Switzerland: 0,    Germany: 0,       France: 0.115, UAE: 0 },
+  // Italy: 26% on investment gold gains (GGI/Agenzia Entrate);
+  // CH: 0% private investor; DE: 0% if held >1yr (26.375% if <1yr);
+  // FR: TFOP 11% + 0.5% CRDS = 11.5% on sale price (or 36.2% CGT by option); UAE: 0%
+
+  Jewelry:   { Italy: 0.26,   Switzerland: 0,    Germany: 0.26375, France: 0.065, UAE: 0 },
+  // Italy: 26% if gain realised (private sales generally not tracked, but taxable in principle);
+  // CH: 0%; DE: 26.375% if sold within 1yr and gains >€1k;
+  // FR: TFOP 6% + 0.5% CRDS = 6.5% on sale price (Council of State 2023); UAE: 0%
+
+  Watches:   { Italy: 0.26,   Switzerland: 0,    Germany: 0.26375, France: 0.065, UAE: 0 },
+  // Italy: 26% on gain; CH: 0%; DE: 26.375% if <1yr holding;
+  // FR: TFOP 6.5% (watches = jewelry per Council of State Dec 2023); UAE: 0%
+
+  Art:       { Italy: 0,      Switzerland: 0,    Germany: 0.26375, France: 0.065, UAE: 0 },
+  // Italy: no CGT on art for private individuals (not listed in art.67 TUIR);
+  // CH: 0%; DE: 26.375% if <1yr; FR: TFOP 6.5% on sale price; UAE: 0%
+
+  Business:  { Italy: 0.26,   Switzerland: 0,    Germany: 0.26375, France: 0.30,  UAE: 0 },
+  // Italy: 26% on non-qualified shareholdings (art.68 TUIR);
+  // CH: 0% private investor; DE: 26.375% Abgeltungsteuer;
+  // FR: 30% PFU; UAE: 0%
+
+  Other:     { Italy: 0.26,   Switzerland: 0,    Germany: 0.26375, France: 0.30,  UAE: 0 },
+  // Generic fallback: standard capital-gains rates
+};
+
+/** Countries shown in the tax scenario panel */
+export const TAX_COUNTRIES = ['Italy', 'Switzerland', 'Germany', 'France', 'UAE'];
+
+/**
+ * Compute total tax and net value for a given country,
+ * applying the per-category rate to each asset's EUR value.
+ * @param {string} country
+ * @param {Array}  assets
+ * @returns {{ country, grossTotal, totalTax, netTotal, effectiveRate }}
+ */
+export function computeTaxForCountry(country, assets) {
+  let grossTotal = 0;
+  let totalTax   = 0;
+  for (const asset of assets) {
+    const val  = asset.valueEUR || 0;
+    const rates = TAX_RATES_BY_CATEGORY[asset.category] || TAX_RATES_BY_CATEGORY.Other;
+    const rate  = rates[country] ?? 0;
+    grossTotal += val;
+    totalTax   += val * rate;
+  }
+  const netTotal      = grossTotal - totalTax;
+  const effectiveRate = grossTotal > 0 ? totalTax / grossTotal : 0;
+  return { country, grossTotal, totalTax, netTotal, effectiveRate };
+}
 
 export const CATEGORY_DEFS = [
   ['Car',       'Sedan / SUV / sports car'],
@@ -203,25 +290,71 @@ export function renderHero() {
 
 /* ── Render: Taxes ──────────────────────────────────────────── */
 export function renderTaxes() {
-  const { total } = totals();
-  const markup = TAX_MODELS.map(t => {
-    const retained = total * (1 - t.rate);
-    const pct = (1 - t.rate) * 100;
+  if (!state.assets.length) {
+    const empty = `<div class="empty">
+      <div class="empty-badge sf-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><use href="#icon-tax"></use></svg></div>
+      <strong>No assets</strong>
+      <p class="small muted">Add assets to see the tax scenario.</p>
+    </div>`;
+    $('taxOverview').innerHTML = empty;
+    $('taxCountryTable').innerHTML = empty;
+    return;
+  }
+
+  const markup = TAX_COUNTRIES.map(country => {
+    const { grossTotal, totalTax, netTotal, effectiveRate } = computeTaxForCountry(country, state.assets);
+    const retainedPct = grossTotal > 0 ? (netTotal / grossTotal) * 100 : 100;
+    const taxPct      = 100 - retainedPct;
+
+    // Build per-category tax breakdown rows
+    const catBreakdown = CATEGORY_DEFS
+      .map(([name]) => {
+        const catAssets = state.assets.filter(a => a.category === name);
+        if (!catAssets.length) return null;
+        const catGross = catAssets.reduce((s, a) => s + a.valueEUR, 0);
+        const rates    = TAX_RATES_BY_CATEGORY[name] || TAX_RATES_BY_CATEGORY.Other;
+        const rate     = rates[country] ?? 0;
+        const catTax   = catGross * rate;
+        const catNet   = catGross - catTax;
+        return `<div class="tax-cat-row">
+          <span class="tax-cat-name">${esc(name)}</span>
+          <span class="tax-cat-rate muted">${plain((rate * 100).toFixed(1))}%</span>
+          <span class="tax-cat-tax">&minus;${euro(catTax)}</span>
+          <span class="tax-cat-net asset-value">${euro(catNet)}</span>
+        </div>`;
+      })
+      .filter(Boolean)
+      .join('');
+
     return `
       <article class="tax-card rise-in">
         <div class="row">
-          <div><strong>${esc(t.country)}</strong></div>
-          <div class="asset-value" style="font-size:17px">${euro(retained)}</div>
+          <div><strong>${esc(country)}</strong></div>
+          <div class="asset-value" style="font-size:17px">${euro(netTotal)}</div>
         </div>
-        <div class="bar" role="progressbar" aria-valuenow="${pct.toFixed(0)}" aria-valuemin="0" aria-valuemax="100" aria-label="${esc(t.country)} net retained">
-          <div class="fill" style="width:${pct}%"></div>
+        <div class="bar" role="progressbar" aria-valuenow="${retainedPct.toFixed(0)}" aria-valuemin="0" aria-valuemax="100" aria-label="${esc(country)} net retained">
+          <div class="fill" style="width:${retainedPct}%"></div>
         </div>
         <div class="row small muted">
-          <span>Net remaining</span>
-          <span>${plain(pct.toFixed(0))}% retained</span>
+          <span>Net after tax</span>
+          <span>${plain(retainedPct.toFixed(1))}% retained &middot; &minus;${euro(totalTax)} tax</span>
         </div>
+        <div class="row small muted" style="margin-top:2px">
+          <span>Effective rate</span>
+          <span>${plain((effectiveRate * 100).toFixed(2))}%</span>
+        </div>
+        ${catBreakdown ? `<details class="tax-breakdown">
+          <summary class="small muted">Per-category breakdown</summary>
+          <div class="tax-cat-grid">
+            <div class="tax-cat-row tax-cat-header">
+              <span>Category</span><span>Rate</span><span>Tax</span><span>Net</span>
+            </div>
+            ${catBreakdown}
+          </div>
+        </details>` : ''}
       </article>`;
   }).join('');
+
   $('taxOverview').innerHTML = markup;
   $('taxCountryTable').innerHTML = markup;
 }
